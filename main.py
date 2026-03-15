@@ -1,61 +1,53 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
+from typing import Optional
 import uvicorn
-import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
-import os
 
-from config import settings
-from database import engine, init_db, get_db
-from api import auth, users, images
-from dependencies import log_usage
-from utils.security import get_password_hash
+from database import get_db, init_db
+from auth import authenticate_user, create_access_token, verify_token
+from models import User
+import sqlite3
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Pydantic模型
+class Token(BaseModel):
+    """令牌响应模型"""
+    access_token: str
+    token_type: str = "bearer"
 
 
+class UserBase(BaseModel):
+    """用户基础模型"""
+    username: str
+    email: str
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+# 创建FastAPI应用
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
-    logger.info("启动智能证件照处理系统...")
-
-    # 创建数据库表
-    try:
-        await init_db()
-        logger.info("数据库初始化完成")
-
-        # 创建上传目录
-        os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-        logger.info(f"创建上传目录: {settings.UPLOAD_DIR}")
-
-    except Exception as e:
-        logger.error(f"启动失败: {e}")
-        raise
+    print("🚀 启动智能证件照系统...")
+    await init_db()
+    print("✅ 数据库初始化完成")
 
     yield
 
     # 关闭时
-    logger.info("关闭应用...")
-    await engine.dispose()
+    print("👋 关闭应用...")
 
 
-# 创建FastAPI应用
 app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.APP_VERSION,
+    title="智能证件照系统",
     description="智能证件照处理系统后端API",
-    docs_url="/docs" if settings.DEBUG else None,
-    redoc_url="/redoc" if settings.DEBUG else None,
+    version="1.0.0",
     lifespan=lifespan
 )
 
@@ -68,76 +60,124 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# 全局异常处理
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"全局异常: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "服务器内部错误"}
-    )
-
-
-# 中间件：记录请求时间
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    start_time = datetime.utcnow()
-    response = await call_next(request)
-    process_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-    response.headers["X-Process-Time"] = f"{process_time:.2f}ms"
-    return response
-
-
-# 中间件：记录访问日志
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    logger.info(f"请求: {request.method} {request.url.path}")
-    response = await call_next(request)
-    logger.info(f"响应: {request.method} {request.url.path} - {response.status_code}")
-    return response
+# OAuth2密码模式
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
 # 健康检查端点
-@app.get("/health")
-async def health_check():
-    """健康检查"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "service": settings.APP_NAME,
-        "version": settings.APP_VERSION
-    }
-
-
-# 根端点
 @app.get("/")
 async def root():
     """根端点"""
     return {
-        "message": f"欢迎使用{settings.APP_NAME}",
-        "version": settings.APP_VERSION,
-        "docs": "/docs" if settings.DEBUG else None,
+        "message": "欢迎使用智能证件照系统",
         "endpoints": {
-            "auth": "/api/auth",
-            "users": "/api/users",
-            "images": "/api/images"
+            "login": "POST /login - 用户登录",
+            "me": "GET /me - 获取当前用户信息"
         }
     }
 
 
-# 注册API路由
-app.include_router(auth.router, prefix="/api/auth")
-app.include_router(users.router, prefix="/api/users")
-# 注意：images路由将在后续步骤中创建
+@app.get("/health")
+async def health_check():
+    """健康检查"""
+    return {"status": "healthy"}
 
-# 挂载静态文件（用于存储上传的文件）
-app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+
+# 登录路由
+@app.post("/login", response_model=Token)
+async def login(
+        form_data: OAuth2PasswordRequestForm = Depends(),
+        db: AsyncSession = Depends(get_db)
+):
+    """
+    用户登录
+
+    使用测试用户登录：
+    - 用户名: testuser
+    - 密码: Test123!
+    """
+    # 认证用户
+    user = await authenticate_user(db, form_data.username, form_data.password)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户名或密码错误",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 创建访问令牌
+    access_token = create_access_token(
+        data={"sub": user.username, "user_id": user.id}
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+
+# 获取当前用户信息的依赖项
+async def get_current_user(
+        token: str = Depends(oauth2_scheme),
+        db: AsyncSession = Depends(get_db)
+):
+    """获取当前登录用户"""
+    from sqlalchemy import select
+
+    # 验证令牌
+    payload = verify_token(token)
+    username: str = payload.get("sub")
+
+    if username is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的令牌"
+        )
+
+    # 查询用户
+    result = await db.execute(
+        select(User).where(User.username == username)
+    )
+    user = result.scalar_one_or_none()
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户不存在"
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户已被禁用"
+        )
+
+    return user
+
+
+# 获取当前用户信息
+@app.get("/me", response_model=UserBase)
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    """获取当前登录用户的信息"""
+    return current_user
+
+
+# 受保护的路由示例
+@app.get("/protected")
+async def protected_route(current_user: User = Depends(get_current_user)):
+    """需要登录才能访问的受保护路由"""
+    return {
+        "message": f"你好, {current_user.username}!",
+        "user_id": current_user.id,
+        "email": current_user.email
+    }
+
 
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=settings.DEBUG
+        reload=True
     )
